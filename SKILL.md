@@ -23,8 +23,8 @@ These are the things where deviation produces silent failures or broken output. 
 3. **30ms audio fades at every segment boundary** (`afade=t=in:st=0:d=0.03,afade=t=out:st={dur-0.03}:d=0.03`). Otherwise audible pops at every cut.
 4. **Overlays use `setpts=PTS-STARTPTS+T/TB`** to shift the overlay's frame 0 to its window start. Otherwise you see the middle of the animation during the overlay window.
 5. **Master SRT uses output-timeline offsets**: `output_time = word.start - segment_start + segment_offset`. Otherwise captions misalign after segment concat.
-6. **Never cut inside a word.** Snap every cut edge to a word boundary from the Scribe transcript.
-7. **Pad every cut edge.** Working window: 30–100ms. Scribe timestamps drift 50–100ms — padding absorbs the drift. Tighter for fast-paced.
+6. **Never cut inside a word.** Snap every cut edge to a word boundary from the whisper transcript.
+7. **Pad every cut edge.** Working window: 30–100ms. Whisper word timestamps drift 50–100ms — padding absorbs the drift. Tighter for fast-paced.
 8. **Word-level verbatim ASR only.** Never SRT/phrase mode (loses sub-second gap data). Never normalized fillers (loses editorial signal).
 9. **Cache transcripts per source.** Never re-transcribe unless the source file itself changed.
 10. **Parallel sub-agents for multiple animations.** Never sequential. Spawn N at once via the `Agent` tool; total wall time ≈ slowest one.
@@ -43,11 +43,10 @@ The skill lives in `video-use/`. User footage lives wherever they put it. All se
     ├── project.md               ← memory; appended every session
     ├── takes_packed.md          ← phrase-level transcripts, the LLM's primary reading view
     ├── edl.json                 ← cut decisions
-    ├── transcripts/<name>.json  ← cached raw Scribe JSON
+    ├── transcripts/<name>.json  ← cached word-level whisper JSON
     ├── animations/slot_<id>/    ← per-animation source + render + reasoning
-    ├── clips_graded/            ← per-segment extracts with grade + fades
+    ├── clips_graded/            ← per-segment extracts with fades
     ├── master.srt               ← output-timeline subtitles
-    ├── downloads/               ← yt-dlp outputs
     ├── verify/                  ← debug frames / timeline PNGs
     ├── preview.mp4
     └── final.mp4
@@ -57,34 +56,32 @@ The skill lives in `video-use/`. User footage lives wherever they put it. All se
 
 First-time install lives in `install.md` (clone, deps, ffmpeg, skill registration, API key). Don't re-run it every session; on cold start just verify:
 
-- `ELEVENLABS_API_KEY` resolves — either in the environment or in `.env` at the video-use repo root. If missing, ask the user to paste one and write it to `.env` (never to the user's `<videos_dir>`).
+- Local whisper works — transcription runs on-device via the `transcribe-local` skill (`mlx-whisper` on the Apple Silicon Metal GPU). No API key needed. If `mlx-whisper` is missing, follow that skill's setup.
 - `ffmpeg` + `ffprobe` on PATH.
 - Python deps installed (`uv sync` or `pip install -e .` inside the repo).
 - Node.js + npm available if the session needs HyperFrames or Remotion slots. HyperFrames currently requires Node.js 22+.
-- `yt-dlp`, HyperFrames, Remotion, Manim installed only on first use.
+- HyperFrames, Remotion, Manim installed only on first use.
 - First-use animation setup happens inside the slot directory, never at the video-use repo root. HyperFrames can be invoked with `npx --yes hyperframes ...`; Remotion can be scaffolded with `npx create-video@latest` or installed as a project-local dependency before using its `remotion render` command.
 - This skill vendors `skills/manim-video/`. Read its SKILL.md when building a Manim slot.
 
-Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this SKILL.md. Resolve their paths relative to the directory containing this file — the skill is typically symlinked at `~/.claude/skills/video-use/` or `~/.codex/skills/video-use/`.
+Helpers (`helpers/pack_transcripts.py`, `helpers/render.py`, etc.) live alongside this SKILL.md. Resolve their paths relative to the directory containing this file — the skill is typically symlinked at `~/.claude/skills/video-use/` or `~/.codex/skills/video-use/`.
 
 ## Helpers
 
-- **`transcribe.py <video>`** — single-file Scribe call. `--num-speakers N` optional. Cached.
-- **`transcribe_batch.py <videos_dir>`** — 4-worker parallel transcription. Use for multi-take.
+- **Transcription — use the `transcribe-local` skill** (`mlx-whisper`, GPU-accelerated, on-device). Request word-level timestamps and write each result to `<edit>/transcripts/<name>.json` as a word list compatible with `pack_transcripts.py` (entries with `text`, `start`, `end`, type `word`/`spacing`). Cached per source — never re-transcribe unchanged files.
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
 - **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline.
-- **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.
 
 ## The process
 
-1. **Inventory.** `ffprobe` every source. `transcribe_batch.py` on the directory. `pack_transcripts.py` to produce `takes_packed.md`. Sample one or two `timeline_view`s for a visual first impression.
+1. **Inventory.** `ffprobe` every source. Transcribe every source with the `transcribe-local` skill (word-level, into `transcripts/`). `pack_transcripts.py` to produce `takes_packed.md`. Sample one or two `timeline_view`s for a visual first impression.
 2. **Pre-scan for problems.** One pass over `takes_packed.md` to note verbal slips, obvious mis-speaks, or phrasings to avoid. Plain list, feed into the editor brief.
-3. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation and grade preferences, subtitle needs. Do not use a fixed checklist — the right questions are different every time.
-4. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, grade direction, subtitle style, length estimate. **Wait for confirmation.**
-5. **Execute.** Produce `edl.json` via the editor sub-agent brief. Drill into `timeline_view` at ambiguous moments. Build animations in parallel sub-agents. Apply grade per-segment. Compose via `render.py`.
+3. **Converse.** Describe what you see in plain English. Ask questions *shaped by the material*. Collect: content type, target length/aspect, aesthetic/brand direction, pacing feel, must-preserve moments, must-cut moments, animation preferences, subtitle needs. Do not use a fixed checklist — the right questions are different every time.
+4. **Propose strategy.** 4–8 sentences: shape, take choices, cut direction, animation plan, subtitle style, length estimate. **Wait for confirmation.**
+5. **Execute.** Produce `edl.json` via the editor sub-agent brief. Drill into `timeline_view` at ambiguous moments. Build animations in parallel sub-agents. Compose via `render.py`.
 6. **Preview.** `render.py --preview`.
 7. **Self-eval (before showing the user).** Run `timeline_view` on the **rendered output** (not the sources) at every cut boundary (±1.5s window). Check each image for:
    - Visual discontinuity / flash / jump at the cut
@@ -92,7 +89,7 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
    - Subtitle hidden behind an overlay (Rule 1 violation)
    - Overlay misaligned or showing wrong frames (Rule 4 violation)
 
-   Also sample: first 2s, last 2s, and 2–3 mid-points — check grade consistency, subtitle readability, overall coherence. Run `ffprobe` on the output to verify duration matches the EDL expectation.
+   Also sample: first 2s, last 2s, and 2–3 mid-points — check visual consistency, subtitle readability, overall coherence. Run `ffprobe` on the output to verify duration matches the EDL expectation.
 
    If anything fails: fix → re-render → re-eval. **Cap at 3 self-eval passes** — if issues remain after 3, flag them to the user rather than looping forever. Only present the preview once the self-eval passes.
 8. **Iterate + persist.** Natural-language feedback, re-plan, re-render. Never re-transcribe. Final render on confirmation. Append to `project.md`.
@@ -156,22 +153,6 @@ OUTPUT (JSON array, no prose):
 
 Return the final EDL and a one-line total runtime check.
 ```
-
-## Color grade (when requested)
-
-Your job is to **reason about the image**, not apply a preset. Look at a frame (via `timeline_view`), decide what's wrong, adjust one thing, look again.
-
-Mental model is ASC CDL. Per channel: `out = (in * slope + offset) ** power`, then global saturation. `slope` → highlights, `offset` → shadows, `power` → midtones.
-
-**Example filter chains** (`grade.py` has `--list-presets`; use them as starting points or mix your own):
-
-- **`warm_cinematic`** — retro/technical, subtle teal/orange split, desaturated. Shipped in a real launch video. Safe for talking heads.
-- **`neutral_punch`** — minimal corrective: contrast bump + gentle S-curve. No hue shifts.
-- **`none`** — straight copy. Default when the user hasn't asked.
-
-For anything else — portraiture, nature, product, music video, documentary — invent your own chain. `grade.py --filter '<raw ffmpeg>'` accepts any filter string.
-
-Hard rules: apply **per-segment during extraction** (not post-concat, which re-encodes twice). Never go aggressive without testing skin tones.
 
 ## Subtitles (when requested)
 
@@ -275,7 +256,6 @@ Match the source unless the user asked for something specific. Common targets: `
     {"source": "C0108", "start": 14.30, "end": 28.90,
      "beat": "SOLUTION", "quote": "...", "reason": "Only take without the false start."}
   ],
-  "grade": "warm_cinematic",
   "overlays": [
     {"file": "edit/animations/slot_1/render.mp4", "start_in_output": 0.0, "duration": 5.0}
   ],
@@ -284,7 +264,7 @@ Match the source unless the user asked for something specific. Common targets: `
 }
 ```
 
-`grade` is a preset name or raw ffmpeg filter. `overlays` are rendered animation clips. `subtitles` is optional and applied LAST.
+`overlays` are rendered animation clips. `subtitles` is optional and applied LAST.
 
 ## Memory — `project.md`
 
@@ -294,7 +274,7 @@ Append one section per session at `<edit>/project.md`:
 ## Session N — YYYY-MM-DD
 
 **Strategy:** one paragraph describing the approach
-**Decisions:** take choices, cuts, grades, animations + why
+**Decisions:** take choices, cuts, animations + why
 **Reasoning log:** one-line rationale for non-obvious decisions
 **Outstanding:** deferred items
 ```
@@ -308,7 +288,7 @@ Things that consistently fail regardless of style:
 - **Hierarchical pre-computed codec formats** with USABILITY / tone tags / shot layers. Over-engineering. Derive from the transcript at decision time.
 - **Hand-tuned moment-scoring functions.** The LLM picks better than any heuristic you'll write.
 - **Whisper SRT / phrase-level output.** Loses sub-second gap data. Always word-level verbatim.
-- **Running Whisper locally on CPU.** Slow and it normalizes fillers. Use hosted Scribe.
+- **Running Whisper on CPU.** Many times slower. Use `mlx-whisper` on the Metal GPU via the `transcribe-local` skill.
 - **Burning subtitles into base before compositing overlays.** Overlays hide them. (Hard Rule 1.)
 - **Single-pass filtergraph when you have overlays.** Double re-encodes. Use per-segment extract → concat.
 - **Linear animation easing.** Looks robotic. Always cubic.
