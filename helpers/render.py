@@ -49,10 +49,10 @@ except Exception:
 # every major vertical-video platform. Do not drop this below ~75 without a
 # specific reason.
 SUB_FORCE_STYLE = (
-    "FontName=Helvetica,FontSize=18,Bold=1,"
-    "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
-    "BorderStyle=1,Outline=2,Shadow=0,"
-    "Alignment=2,MarginV=90"
+    "FontName=Arial,FontSize=95,Bold=1,"
+    "PrimaryColour=&H003333FF,SecondaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00FFFFFF,"
+    "BorderStyle=1,Outline=1.5,Shadow=16,"
+    "Alignment=2,MarginV=380"
 )
 
 # -------- Helpers ------------------------------------------------------------
@@ -132,15 +132,29 @@ def is_hdr_source(video: Path) -> bool:
 
 
 def is_portrait_source(video: Path) -> bool:
-    """Return True if the video's height > width (portrait / vertical)."""
+    """Return True if the video's height > width (portrait / vertical), accounting for rotation."""
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height",
-             "-of", "csv=p=0", str(video)],
+             "-show_entries", "stream_side_data=rotation",
+             "-of", "json", str(video)],
             capture_output=True, text=True, check=True,
         )
-        w, h = map(int, out.stdout.strip().split(","))
+        data = json.loads(out.stdout)
+        stream = data["streams"][0]
+        w = int(stream["width"])
+        h = int(stream["height"])
+        
+        rotation = 0
+        for sd in stream.get("side_data_list", []):
+            if "rotation" in sd:
+                rotation = int(sd["rotation"])
+                break
+        
+        if abs(rotation) in (90, 270):
+            w, h = h, w
+            
         return h > w
     except Exception:
         return False
@@ -312,6 +326,112 @@ def _words_in_range(transcript: dict, t_start: float, t_end: float) -> list[dict
     return out
 
 
+def build_master_ass(edl: dict, edit_dir: Path, out_path: Path) -> None:
+    """Build an output-timeline ASS from per-source transcripts with word-level RTL karaoke highlights."""
+    transcripts_dir = edit_dir / "transcripts"
+    sources = edl["sources"]
+
+    entries: list[dict] = []
+    seg_offset = 0.0
+
+    for r in edl["ranges"]:
+        src_name = r["source"]
+        seg_start = float(r["start"])
+        seg_end = float(r["end"])
+        seg_duration = seg_end - seg_start
+
+        tr_path = transcripts_dir / f"{src_name}.json"
+        if not tr_path.exists():
+            seg_offset += seg_duration
+            continue
+
+        transcript = json.loads(tr_path.read_text())
+        words_in_seg = _words_in_range(transcript, seg_start, seg_end)
+
+        for w in words_in_seg:
+            text = (w.get("text") or "").strip()
+            if not text:
+                continue
+            ws = w.get("start")
+            we = w.get("end")
+            if ws is None or we is None:
+                continue
+            out_ws = max(0.0, ws - seg_start) + seg_offset
+            out_we = max(0.0, we - seg_start) + seg_offset
+            if out_we <= out_ws:
+                out_we = out_ws + 0.2
+            entries.append({
+                "text": text,
+                "start": out_ws,
+                "end": out_we
+            })
+
+        seg_offset += seg_duration
+
+    chunks: list[list[dict]] = []
+    current_chunk: list[dict] = []
+    for w in entries:
+        current_chunk.append(w)
+        text = w["text"]
+        ends_in_punct = bool(text) and text[-1] in PUNCT_BREAK
+        if len(current_chunk) >= 2 or ends_in_punct:
+            chunks.append(current_chunk)
+            current_chunk = []
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    dialogue_lines: list[str] = []
+    for chunk in chunks:
+        display_words = [w["text"].rstrip(",;:") for w in chunk]
+
+        for i, active_word in enumerate(chunk):
+            hl_start = active_word["start"]
+            hl_end = active_word["end"]
+            
+            styled_parts = []
+            for j, w in enumerate(chunk):
+                clean_text = display_words[j]
+                if j == i:
+                    styled_parts.append(f"{{\\c&H003333FF&}}{clean_text}")
+                else:
+                    styled_parts.append(f"{{\\c&H00FFFFFF&}}{clean_text}")
+            
+            phrase_text = " ".join(reversed(styled_parts))
+            final_text = f"\u200f\u202b{{\\blur8}}{phrase_text}\u202c"
+            
+            def format_ass_time(sec: float) -> str:
+                sec = max(0.0, sec)
+                h = int(sec // 3600)
+                m = int((sec % 3600) // 60)
+                s = int(sec % 60)
+                cc = int(round((sec - int(sec)) * 100))
+                if cc >= 100:
+                    cc = 99
+                return f"{h}:{m:02d}:{s:02d}.{cc:02d}"
+
+            start_str = format_ass_time(hl_start)
+            end_str = format_ass_time(hl_end)
+            dialogue_lines.append(
+                f"Dialogue: 0,{start_str},{end_str},HebrewKaraoke,,0,0,0,,{final_text}"
+            )
+
+    ass_template = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, Strikeout, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: HebrewKaraoke,Arial,95,&H00FFFFFF,&H003333FF,&H00000000,&H00FFFFFF,1,0,0,0,100,100,0,0,1,1.5,16,2,10,10,380,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+""" + "\n".join(dialogue_lines) + "\n"
+
+    out_path.write_text(ass_template, encoding="utf-8")
+    print(f"master ASS generated successfully → {out_path.name} ({len(dialogue_lines)} cues)")
+
+
 def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
     """Build an output-timeline SRT from per-source transcripts.
 
@@ -368,6 +488,7 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
             # Strip trailing punctuation for cleaner uppercase look
             text = text.rstrip(",;:")
             text = text.upper()
+            text = f"\u200f\u202b{text}\u202c"
             entries.append((out_start, out_end, text))
 
         seg_offset += seg_duration
@@ -630,8 +751,9 @@ def main() -> None:
     subs_path: Path | None = None
     if not args.no_subtitles:
         if args.build_subtitles:
-            subs_path = edit_dir / "master.srt"
-            build_master_srt(edl, edit_dir, subs_path)
+            p = edit_dir / "master.ass"
+            build_master_ass(edl, edit_dir, p)
+            subs_path = p
         elif edl.get("subtitles"):
             subs_path = resolve_path(edl["subtitles"], edit_dir)
             if not subs_path.exists():
